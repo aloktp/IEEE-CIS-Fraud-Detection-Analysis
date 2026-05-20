@@ -338,6 +338,8 @@ High fraud concentrations are repeatedly associated with browsers such as Opera,
 
 3. Android mobile ecosystems show elevated fraud exposure.
 
+Mobile > Desktop for fraud rates.
+
 Several Android + Chrome and Android + Other Browser combinations show materially higher fraud rates than the dataset baseline. This may indicate emulator usage, disposable mobile environments, or lower device trust consistency within parts of the Android ecosystem.
 
 4. High-volume medium-risk segments may be operationally more important than tiny extreme-risk groups.
@@ -351,20 +353,45 @@ Several desktop-based "No Identity Match" segments show elevated fraud rates, wh
 6. Small-sample extreme fraud rates should be treated cautiously.
 
 Some combinations show very high fraud percentages but extremely low transaction counts. Larger-volume segments provide more reliable and production-relevant fraud signals.
+
+/* 
+7. The raw id_31, id_30, and DeviceInfo columns are have too many distinct unique categorical values to give directly to the model.
+   
+   For example, id_31 has 100+ different browser strings for Chrome e.g.. "chrome 62.0.3202.84" and "chrome 62.0.3202.75"  even though they are basically the same browser.
+   
+   Same problem with id_30 for OS, and DeviceInfo has 1,700+ unique hardware strings. 
+   If we feed all this into model, it will become unstable. We have to do grouping by CASE keyword.
+    
+   That is why the same CASE logic from EDA will be given in staging stage, and thus get permanently encoded in
+   stg_identity.sql.
+
+8. The fraud rate differences between the groups are large enough to justify making them permanent features i.e. not just leaving them in EDA.
+   e.g. Exotic browsers show fraud rates well above the 3.5% dataset baseline.
+   Browsers such as seamonkey, pufferfox etc. 
+   
+   Old OS versions like Windows 7 and Android 4 show consistently higher rates.
+   
+   Budget device manufacturers like Huawei also show higher rates than flagship equivalents.
+   
+   Its not noise or random, as we see this pattern consistently across  590K transactions. So it is a real signal worth committing to staging.
 */
 
 /* Candidate fraud features flagged during EDA, to be added in the feature engineering workflow (staging → integration → model input) :-
 
-Potential Features Identified During EDA:
+Why we encode these below as new flag or column is to make the model explainable e.g. "mobile devices are more prone to fraud than 
 
-- has_identity
-- device_type
-- browser_family
-- os_family
-- device_manufacturer_group
-- browser_risk_group
-- device_risk_score
+Potential Features Identified During EDA, confirmed for staging.
 
+   - has_identity          (from int_joined LEFT JOIN result)
+   - device_type           (raw, low cardinality already)
+   - browser_family        (CASE on id_31 — validated by observation 2, 7, 8)
+   - os_group              (CASE on id_30 — validated by observation 3)
+   - os_version_group      (CASE on id_30 — validated by observation 3, 8)
+   - device_manufacturer   (CASE on DeviceInfo — validated by observation 2, 7, 8)
+   - chrome_version_bucket (CASE on id_31 — old Chrome = unpatched = risk)
+   - is_exotic_browser     (binary flag — validated by observation 2, 8)
+   - samsung_tier          (CASE on DeviceInfo — budget vs flagship signal)
+   - no_browser_adn _no_os_signal  (both id_30 and id_31 NULL = bot signal, observation 5)
 */
 
 -- Analysis of Missing Values in Dataset
@@ -411,3 +438,105 @@ addr columns less sparse -> more reliable geo features
 -- For all other columns such as D1-D15, C1-C14, M1-M9 etc.. .., its going to be imputed in stg_transation.sql
 
 -- Also, In later stages, the NULL values in columns like card4 etc and many other string columns are imputated or replaced with string 'unknown' instead of numerical value -999, just to differentiate the models learning process. This will be done in later stage.
+
+-- OS version fraud rates (from id_30)
+SELECT
+CASE
+WHEN i."id_30" ILIKE '%windows 7%' THEN 'Windows 7 (Old)'
+WHEN i."id_30" ILIKE '%windows 10%' THEN 'Windows 10'
+WHEN i."id_30" ILIKE '%windows 8%' THEN 'Windows 8/8.1'
+WHEN i."id_30" ILIKE '%windows vista%'
+OR i."id_30" ILIKE '%windows xp%' THEN 'Windows Vista/XP (Very Old)'
+WHEN i."id_30" ILIKE '%ios 9%' THEN 'iOS 9 (Old)'
+WHEN i."id_30" ILIKE '%ios 10%' THEN 'iOS 10'
+WHEN i."id_30" ILIKE '%ios 11%' THEN 'iOS 11'
+WHEN i."id_30" ILIKE '%android 4%' THEN 'Android 4 (Very Old)'
+WHEN i."id_30" ILIKE '%android 5%' THEN 'Android 5 (Old)'
+WHEN i."id_30" ILIKE '%android 6%' THEN 'Android 6'
+WHEN i."id_30" ILIKE '%android 7%' THEN 'Android 7'
+WHEN i."id_30" ILIKE '%android 8%' THEN 'Android 8'
+WHEN i."id_30" ILIKE '%mac os x 10_13%'
+OR i."id_30" ILIKE '%mac os x 10.13%' THEN 'macOS High Sierra'
+WHEN i."id_30" ILIKE '%mac os x 10_12%'
+OR i."id_30" ILIKE '%mac os x 10.12%' THEN 'macOS Sierra'
+WHEN i."id_30" ILIKE '%mac os x 10_11%'
+OR i."id_30" ILIKE '%mac os x 10.11%' THEN 'macOS El Capitan'
+WHEN i."id_30" ILIKE '%mac os%' THEN 'macOS (Other)'
+WHEN i."id_30" ILIKE '%linux%' THEN 'Linux'
+WHEN i."id_30" IS NULL THEN 'No OS Info'
+ELSE 'Other'
+END AS os_version_group,
+COUNT(*) AS total,
+SUM(t."isFraud") AS fraud_count,
+ROUND(SUM(t."isFraud") * 100.0 / COUNT(*), 2) AS fraud_rate_pct
+FROM FRAUD_DB.RAW.RAW_TRANSACTION t
+LEFT JOIN FRAUD_DB.RAW.RAW_IDENTITY i ON t."TransactionID" = i."TransactionID"
+GROUP BY 1
+ORDER BY fraud_rate_pct DESC;
+
+-- Android 4 and Anroid 5 which are old versions have highest fraud rates (UNPATCHED DEVICES). MacOS has least fraud rates.Windows and Linux has moderate rates.
+
+-- -- Device manufacturer fraud rates (from DeviceInfo hardware string)
+SELECT
+CASE
+WHEN i."DeviceInfo" ILIKE '%SAMSUNG%' OR i."DeviceInfo" ILIKE 'SM-%'
+OR i."DeviceInfo" ILIKE 'GT-%' THEN 'Samsung'
+WHEN i."DeviceInfo" ILIKE '%Moto%'
+OR i."DeviceInfo" ILIKE 'XT%' THEN 'Motorola'
+WHEN i."DeviceInfo" ILIKE 'LG-%'
+OR i."DeviceInfo" ILIKE 'LGL%'
+OR i."DeviceInfo" ILIKE 'LGMS%' THEN 'LG'
+WHEN i."DeviceInfo" ILIKE '%HUAWEI%'
+OR i."DeviceInfo" ILIKE '%Honor%' THEN 'Huawei'
+WHEN i."DeviceInfo" ILIKE '%Redmi%'
+OR i."DeviceInfo" ILIKE '%Xiaomi%' THEN 'Xiaomi'
+WHEN i."DeviceInfo" ILIKE '%Pixel%'
+OR i."DeviceInfo" ILIKE '%Nexus%' THEN 'Google'
+WHEN i."DeviceInfo" ILIKE '%BLU%' THEN 'BLU'
+WHEN i."DeviceInfo" ILIKE '%ZTE%'
+OR i."DeviceInfo" ILIKE '%Blade%' THEN 'ZTE'
+WHEN i."DeviceInfo" ILIKE '%Alcatel%'
+OR i."DeviceInfo" ILIKE '%ONE TOUCH%' THEN 'Alcatel'
+WHEN i."DeviceInfo" ILIKE '%Lenovo%' THEN 'Lenovo'
+WHEN i."DeviceInfo" ILIKE 'TA-%'
+OR i."DeviceInfo" ILIKE '%Nokia%' THEN 'Nokia'
+WHEN i."DeviceInfo" ILIKE '%KF%' THEN 'Amazon Kindle'
+WHEN i."DeviceInfo" ILIKE '%Windows%'
+OR i."DeviceInfo" ILIKE '%rv:%'
+OR i."DeviceInfo" ILIKE '%Trident%' THEN 'Desktop/Non-Mobile'
+WHEN i."DeviceInfo" IS NULL THEN 'No Device Info'
+ELSE 'Other/Unknown'
+END AS device_manufacturer,
+COUNT(*) AS total,
+SUM(t."isFraud") AS fraud_count,
+ROUND(SUM(t."isFraud") * 100.0 / COUNT(*), 2) AS fraud_rate_pct
+FROM FRAUD_DB.RAW.RAW_TRANSACTION t
+LEFT JOIN FRAUD_DB.RAW.RAW_IDENTITY i ON t."TransactionID" = i."TransactionID"
+GROUP BY 1
+ORDER BY fraud_rate_pct DESC;
+
+-- Nokia, Amazon Kindle, ZTE have extremely high fraud rate. i.e. Budget Brands and poor patch protection by these companies.
+
+-- Extended device type: splits NULL into meaningful groups
+SELECT
+CASE
+WHEN i."DeviceType" = 'desktop' THEN 'desktop'
+WHEN i."DeviceType" = 'mobile' THEN 'mobile'
+WHEN i."TransactionID" IS NULL THEN 'no_identity_match'
+ELSE 'unknown_device'
+END AS device_group,
+COUNT(*) AS total,
+SUM(t."isFraud") AS fraud_count,
+ROUND(SUM(t."isFraud") * 100.0 / COUNT(*), 2) AS fraud_rate_pct
+FROM FRAUD_DB.RAW.RAW_TRANSACTION t
+LEFT JOIN FRAUD_DB.RAW.RAW_IDENTITY i ON t."TransactionID" = i."TransactionID"
+GROUP BY 1
+ORDER BY fraud_rate_pct DESC;
+
+/*
+-- 1. Missing identity match shows LOWER fraud rate than mobile/desktop (2.09% vs 10.17%).
+--    No identity match is a different customer profile, not a higher-risk one.
+--    mobile (10.17%) and desktop (6.52%) are the riskier groups.
+--    has_identity = 0 still goes into the model as a feature because the model
+--    needs to know the profile is different, but do not assume it means higher fraud.
+*/
