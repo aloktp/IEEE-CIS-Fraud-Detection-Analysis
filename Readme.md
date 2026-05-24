@@ -1,3 +1,8 @@
+## 🚧 Pending Work to do
+- Implement graph database integration (Neo4j).
+- Use graph algorithms (PageRank, community detection) to identify fraud rings.
+- Visualize transaction networks for anomaly detection.
+
 # Enterprise Fraud Detection & Risk Optimization Platform
 
 ## Case Study
